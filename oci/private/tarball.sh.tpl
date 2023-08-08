@@ -16,11 +16,7 @@ cp_f_with_mkdir() {
   cp -f "${SRC}" "${DST}"
 }
 
-# Replace newlines (unix or windows line endings) with % character.
-# We can't pass newlines to yq due to https://github.com/mikefarah/yq/issues/1430 and 
-# we can't update YQ at the moment because structure_test depends on a specific version:
-# see https://github.com/bazel-contrib/rules_oci/issues/212 
-REPOTAGS="$(tr -d '\r' < "${TAGS_FILE}" | tr '\n' '%')"
+REPOTAGS=($(cat "${TAGS_FILE}"))
 
 MANIFESTS_LENGTH=$("${YQ}" eval '.manifests | length' "${INDEX_FILE}")
 if [[ "${MANIFESTS_LENGTH}" != 1 ]]; then
@@ -33,13 +29,6 @@ if [[ "${MEDIA_TYPE}" == "application/vnd.oci.image.index.v1+json" ]]; then
   # Handle multi-architecture image indexes.
   # Ideally the toolchains we rely on would output these for us, but they don't seem to.
 
-  if [[ -n "${REPOTAGS}" ]]; then
-    echo >&2 "OCI image indexes don't support setting repo tags"
-    echo >&2 "Repo tags can only be set for single-architecture docker-packed images"
-    exit 1
-  fi
-
-  cp "${IMAGE_DIR}/index.json" "${STAGING_DIR}/index.json"
   echo -n '{"imageLayoutVersion": "1.0.0"}' > "${STAGING_DIR}/oci-layout"
 
   INDEX_FILE_MANIFEST_DIGEST=$("${YQ}" eval '.manifests[0].digest | sub(":"; "/")' "${INDEX_FILE}" | tr  -d '"')
@@ -62,6 +51,27 @@ if [[ "${MEDIA_TYPE}" == "application/vnd.oci.image.index.v1+json" ]]; then
       cp_f_with_mkdir "${IMAGE_DIR}/blobs/${LAYER_DIGEST}" ${BLOBS_DIR}/${LAYER_DIGEST}
     done
   done
+
+  TAG_COUNT=${#REPOTAGS[@]}
+  INDEX_MANIFEST_COUNT="$("${YQ}" eval ".manifests | length" "${IMAGE_DIR}/index.json")"
+
+  REPEATED_TAGS=()
+  for TAG in "${REPOTAGS[@]}"; do
+    if [[ "${INDEX_MANIFEST_COUNT}" -gt 0 ]]; then
+      for i in $(seq 1 "${INDEX_MANIFEST_COUNT}"); do
+        REPEATED_TAGS+=("${TAG}")
+      done
+    fi
+  done
+
+  MANIFEST_COPIES=".manifests"
+  if [[ "${#REPOTAGS[@]}" -gt 1 ]]; then
+    for i in $(seq 2 "${#REPOTAGS[@]}"); do
+      MANIFEST_COPIES="${MANIFEST_COPIES} + .manifests"
+    done
+  fi
+
+  repeated_tags="${REPEATED_TAGS[@]}" "${YQ}" -o json eval "(.manifests = ${MANIFEST_COPIES}) *d {\"manifests\": (env(repeated_tags) | split \" \" | map {\"annotations\": {\"org.opencontainers.image.ref.name\": .}})}" "${IMAGE_DIR}/index.json" > "${STAGING_DIR}/index.json"
 else
   # Assume we're dealing with a single application/vnd.docker.distribution.manifest.list.v2+json manifest.
 
@@ -79,11 +89,11 @@ else
     cp_f_with_mkdir "${IMAGE_DIR}/blobs/${LAYER}" "${BLOBS_DIR}/${LAYER}.tar.gz"
   done
 
-  repo_tags="${REPOTAGS}" \
+  repo_tags="${REPOTAGS[@]}" \
   config="blobs/${CONFIG_DIGEST}" \
   layers="${LAYERS}" \
   "${YQ}" eval \
-          --null-input '.[0] = {"Config": env(config), "RepoTags": "${repo_tags}" | envsubst | split("%") | map(select(. != "")) , "Layers": env(layers) | map( "blobs/" + . + ".tar.gz") }' \
+          --null-input '.[0] = {"Config": env(config), "RepoTags": "${repo_tags}" | envsubst | split(" ") | map(select(. != "")) , "Layers": env(layers) | map( "blobs/" + . + ".tar.gz") }' \
           --output-format json > "${STAGING_DIR}/manifest.json"
 fi
 
